@@ -1,18 +1,4 @@
-/**
- * Simple robust WebSocket client with:
- * - reconnect with exponential backoff
- * - subscribe/unsubscribe event handlers by event type
- * - send JSON commands with optional request id and awaits ack via 'ack' event
- *
- * Event message format (incoming):
- * {
- *   "type": "signal" | "trade" | "position" | "strategy_status" | "ack" | "error",
- *   "payload": { ... },
- *   "request_id": "optional"
- * }
- *
- * Outgoing commands should be objects; they will be JSON.stringify'ed.
- */
+
 class WsClient {
   constructor(url, opts = {}) {
     this.url = url;

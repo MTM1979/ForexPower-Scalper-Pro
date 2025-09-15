@@ -1,14 +1,16 @@
-# backend/app/api/routes.py
-
 from fastapi import APIRouter, Depends, HTTPException
 from app.services.signal_engine import signal_engine
 from app.services.trade_executor import trade_executor
 from app.services.performance_tracker import performance_tracker
 from app.models.trade import TradePayload, TradeResponse
+from app.api.auth import router as auth_router
 import logging
 
 router = APIRouter()
 logger = logging.getLogger("ForexPowerScalperPro")
+
+# Include authentication routes
+router.include_router(auth_router, prefix="/auth")
 
 @router.get("/signals", response_model=list[dict])
 async def get_signals():

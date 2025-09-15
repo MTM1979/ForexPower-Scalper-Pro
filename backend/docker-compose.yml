@@ -6,6 +6,8 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: forex-backend
+    environment:
+      - JWT_SECRET=forexsecret
     ports:
       - "8000:8000"
     depends_on:
@@ -32,3 +34,36 @@ services:
 
 volumes:
   redis_data:
+  version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: forex-backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.backend.rule=Host(`api.forexpowerscalper.com`)"
+      - "traefik.http.routers.backend.entrypoints=websecure"
+      - "traefik.http.routers.backend.tls.certresolver=letsencrypt"
+    environment:
+      - JWT_SECRET=forexsecret
+    restart: always
+
+  traefik:
+    image: traefik:v2.10
+    container_name: traefik
+    command:
+      - "--api.insecure=false"
+      - "--entrypoints.websecure.address=:443"
+      - "--providers.docker=true"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=websecure"
+      - "--certificatesresolvers.letsencrypt.acme.email=admin@forexpowerscalper.com"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "./letsencrypt:/letsencrypt"
+
