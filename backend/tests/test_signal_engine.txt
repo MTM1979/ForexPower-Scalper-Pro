@@ -1,0 +1,6 @@
+from app.services.signal_engine import signal_engine
+
+def test_get_recent_signals():
+    signals = signal_engine.get_recent_signals()
+    assert isinstance(signals, list)
+    assert all("symbol" in s for s in signals)
