@@ -19,3 +19,5 @@ class PerformanceTracker:
             "wins": wins,
             "net_profit": round(net_profit, 2)
         }
+
+performance_tracker = PerformanceTracker()
