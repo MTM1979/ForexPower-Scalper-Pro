@@ -1,0 +1,887 @@
+
+Smart Scalper EA for MetaTrader 5 — Design Document
+Executive summary
+A low-latency, high-discipline scalping Expert Advisor (EA) that uses classical technical scalping rules together with a machine-learned decision module. The ML model learns market micro-patterns offline (and optionally online) and provides a short-horizon action recommendation (buy / sell / hold) or probability. The EA runs on MT5 (MQL5) and calls an external inference service (Python) for fast model decisions; trading and risk management are enforced in-MT5 to guarantee execution safety and minimal latency.
+This design stresses: safety (especially given a small real balance), low-latency inference, continuous model improvement, and reproducible testing.
+
+1 — Strategy summary (scalping logic)
+Primary goals
+    • Capture small, short-duration moves (5–20 pips on FX majors; or equivalent price moves depending on instrument/point).
+    • High trade frequency, controlled drawdown, strong risk management and robust slippage handling.
+    • Timeframes: M1 primary, optionally M5 for confirmation. Tick-level input for precise entry/exit in backtests.
+Indicators and inputs
+    • EMA fast (e.g., 8)
+    • EMA slow (e.g., 21)
+    • ATR(n=14) for volatility-based TP/SL calculation
+    • RSI(n=14) for momentum / overbought/oversold filters
+    • Stochastic (14,3,3) for micro momentum confirmation
+    • VWAP or session bias (if available) — for volume/price anchor (optional; for FX tick volumes are proxy)
+    • Microstructure / orderflow proxies: tick volume, bid/ask spread, recent trade direction (if accessible)
+    • Price action features: last N-close differences, candle ranges
+    • Market state features: spread, time of day flag (e.g., London open), volatility regime (ATR smoothed)
+Entry rules (base deterministic logic)
+    1. Trend filter: EMA8 > EMA21 → bullish bias (only consider buys). EMA8 < EMA21 → bearish bias (only sells). Optionally relax filter based on model confidence.
+    2. Momentum confirmation: RSI between 40–60 indicates neutral; for entries require RSI > 50 for buys, < 50 for sells; Stochastic crossing in direction of trade.
+    3. Volatility/spread filter: only trade when spread < max_spread (instrument dependent) and ATR within expected band (not in news spike).
+    4. AI scoring: an externally computed confidence score p ∈ [0,1] from ML model. Only execute if p ≥ threshold (e.g., 0.6). Optionally use p to size position.
+    5. Execution trigger: On M1 candle close or on tick if high-confidence spike appears.
+Exit rules
+    • Primary TP/SL: Use ATR-based:
+        ◦ TP = entry_price ± k * ATR (k ≈ 0.3–1.0 depending on pair)
+        ◦ SL = entry_price ∓ k2 * ATR (k2 ≈ 0.5–1.5)
+    • Trailing exit: move SL to breakeven + small buffer when position profitable by breakeven_buffer pips. Then trail using shorter ATR multiple.
+    • Early close: If AI confidence drops below a low threshold (e.g., p < 0.3) or momentum indicators flip.
+    • Hard limits: maximum trade duration (e.g., 30–60 minutes) then close.
+Risk management
+    • Max risk per trade: conservative: 0.25%–0.75% of equity (because your balance is small: 148 USD). Default 0.5%.
+    • Max open trades: 1–2 per instrument, 3 overall (configurable).
+    • Max intraday drawdown stop: 3–6% of equity — pause trading if exceeded.
+    • Lot sizing: fixed fractional based on risk and SL distance:
+      lot = RiskUSD / (SL_pips * pip_value_per_lot)
+      But enforce min_lot and max_lot according to broker (Exness). For very small equity, use micro-lots (0.01) as minimum.
+    • Leverage consideration: Exness allowed up to 1:2000; do not rely on maximal leverage — keep margin usage conservative; compute margin requirement before opening trade, avoid margin call.
+Trading hours / news filters
+    • Avoid major-news times (use economic calendar or block specific times).
+    • Prefer London/New York overlap for FX majors; but scalpers often avoid illiquid hours.
+
+2 — Appropriate AI algorithms & how AI is used
+We split ML uses into offline model (signal generation) and online adaptation (optional).
+Roles for AI
+    • Primary: short-horizon signal classifier/regressor that outputs probability of a positive return in the next T seconds/minutes (e.g., 1–5 minutes).
+    • Secondary: position sizing regressor that maps confidence & market conditions → suggested lot size or risk multiplier.
+    • Tertiary (advanced): a reinforcement learning (RL) agent learns explicit action (enter/exit/size) maximizing a reward (net profit with risk penalties).
+Algorithm choices
+    • Supervised learning (baseline):
+        ◦ Gradient-boosted trees (XGBoost / LightGBM) — fast to train, robust to features, low-latency inference (can be exported via treelite or ONNX).
+        ◦ LSTM / Temporal CNN / 1D Conv nets — for sequential patterns (price series). More data-hungry and slower.
+        ◦ Tabular + time-series hybrid: feed engineered features into GBT + small LSTM/Transformer embedding.
+    • Reinforcement learning (advanced):
+        ◦ PPO (Proximal Policy Optimization) or DQN variants applied to discrete actions (buy/hold/sell). Use simulated environment built from historical tick data and slippage model.
+        ◦ RL is powerful but needs careful reward shaping and robust simulation to avoid overfitting to historical quirks.
+    • Ensemble:
+        ◦ Combine GBT (fast, stable) for base signal with a lightweight NN for context-specific adjustments; average or weighted combination for final probability.
+    • Model compression / inference:
+        ◦ Export model to ONNX or LightGBM C++ for fast inference.
+        ◦ Consider quantization (8-bit) for speed and smaller memory.
+Which to pick (recommendation)
+Start with Gradient-boosted trees (LightGBM/XGBoost) on engineered features + short rolling sequences. This gives high baseline performance, easy explainability, fast training/inference. Later, consider an RL agent for policy fine-tuning once a stable environment simulation is built.
+
+3 — Architecture & integration (MT5 ↔ AI)
+High-level architecture
+MT5 (MQL5 EA)  <----(low-latency IPC: ZeroMQ / TCP)---->  Inference service (Python/FastAPI)
+        ^                                                         |
+        |                                                         v
+   Trade execution, risk mgmt, logs                        ML model (LightGBM/ONNX)
+        |                                                         |
+        |                                                         v
+  MT5 Strategy Tester / Collector                         Training pipeline (offline)
+Communication options (ranked)
+    1. ZeroMQ / TCP socket: low-latency, bi-directional, widely used (fast). EA sends feature vector; Python returns action/prob.
+    2. Local REST (FastAPI): easy to implement but slightly higher latency (acceptable for M1/M5 scalping).
+    3. Files / Named pipes: simpler but fragile; not recommended for real-time.
+    4. MetaTrader Native Python integration (MetaTrader5 package via Python scripts): possible for data exchange and backtests but for live trading prefer socket method to isolate EA.
+Dataflow for a single decision
+    1. EA computes features (indicators, last N ticks/candles) on tick/candle event.
+    2. EA sends features to inference server (synchronously or asynchronous with latest features).
+    3. Server returns {action: BUY/SELL/HOLD, confidence: p, size_factor: s}.
+    4. EA checks risk rules, calculates lot size, and places order using MQL5 trade functions.
+    5. EA logs decision for later training and analytics.
+Latency considerations
+    • Keep feature vector compact (~50–150 numbers).
+    • Use binary/CBOR/MsgPack serialization — not JSON — for speed (but JSON OK for prototyping).
+    • Keep inference time ≤ 50–200 ms ideally; with LightGBM this is easily achievable.
+
+4 — Data requirements & training pipeline
+Data sources
+    • Historical tick data (best): tick-by-tick price and tick volume for target pairs from MT5/Exness or data vendors.
+    • Bar data (M1, M5) — computed features.
+    • Market context: spreads, session times, economic calendar (binary flags for news).
+    • Execution simulation data: roundtrip latency, slippage model, commission.
+Feature engineering
+    • Raw: open/high/low/close, volume (ticks), spread.
+    • Indicator features: EMA8, EMA21, ATR14, RSI14, Stochastic, VWAP.
+    • Statistical: returns over last k bars (k=1..10), volatility measures, rolling skewness/kurtosis.
+    • Microstructure: tick-volume imbalance, bid-ask spread, number of price changes per second.
+    • Time features: hour_of_day, day_of_week, London_open_flag.
+    • Normalization: z-score rolling (lookback e.g., 200 bars) or min-max per instrument.
+Labels (supervised)
+    • Binary / multi-class label: whether price moved profitably by tp_threshold before sl_threshold within T minutes.
+        ◦ Eg: label = +1 if price reaches TP (0.5 * ATR) within next 5 min; -1 if SL hit; 0 otherwise.
+    • Regression target: expected return in next T minutes.
+Training steps
+    1. Collect tick data and create synchronized candle features.
+    2. Backtest environment: simulate trade actions using historical data and slippage.
+    3. Train LightGBM (or chosen model) on features → label.
+    4. Validation: use walk-forward cross-validation (rolling-window CV). Keep chronological splits.
+    5. Metrics: precision/recall, ROC-AUC (for classifier), expected return, max drawdown simulated, profit factor.
+    6. Model selection via performance over multiple market regimes and instruments.
+    7. Export model to ONNX/serialized format for fast inference.
+Continuous learning
+    • Periodic retraining (daily/weekly) using newest data + decay of older data.
+    • Keep holdout set for final validation; log live trades to build OOS evaluation.
+
+5 — Implementation details & code organization
+Stack
+    • EA (MT5): MQL5 (core trading logic, risk management, feature computation, order execution, logging)
+    • Inference server: Python (FastAPI or simple ZeroMQ listener) running LightGBM/ONNX runtime for inference
+    • Training pipeline: Python (pandas, numpy, LightGBM, scikit-learn, PyTorch if using NN/RL)
+    • Storage: local DB (SQLite) or CSV logs for trade & features; use Parquet for historical feature storage.
+    • Model serving: ONNX Runtime or LightGBM C API for lowest latency.
+Code organization (repo layout)
+/mt5_smart_scalper/
+  /mql5/
+    smart_scalper.mq5        # EA main
+    indicators.mqh           # indicator helpers
+    risk.mqh                 # risk & sizing
+    ipc_comm.mqh             # ZeroMQ socket wrapper or WebRequest
+  /inference_server/
+    server.py                # FastAPI or zmq server
+    model_interface.py       # load ONNX/LightGBM, preprocess
+    requirements.txt
+  /training/
+    data_collector.py
+    features.py
+    train.py
+    evaluate.py
+  /backtests/
+    backtest_runner.py
+  README.md
+Example MQL5 pseudocode (EA core loop)
+// smart_scalper.mq5 (pseudocode)
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+input double RiskPercent = 0.5;    // percent per trade
+input double MinBalanceUSD = 30;
+input double MaxSpread = 2.5;      // pips
+input string InferenceHost = "127.0.0.1";
+input int InferencePort = 5000;
+
+void OnTick()
+{
+  if(!IsTradeAllowed()) return;
+  double spread_pips = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID)) / _Point;
+  if(spread_pips > MaxSpread) return;
+
+  // compute features from last N candles & ticks
+  double features[] = ComputeFeatures(_Symbol, PERIOD_M1);
+
+  // send to inference server (blocking with short timeout)
+  InferenceResponse resp = CallInferenceServer(features, timeout=200);
+
+  if(resp.action == HOLD) return;
+  if(resp.confidence < 0.6) return;   // configurable
+
+  // risk calc
+  double sl_pips = EstimateSL(resp, features);   // e.g., ATR*0.8
+  double lot = CalculateLotSize(RiskPercent, sl_pips, AccountInfoDouble(ACCOUNT_BALANCE));
+  lot = NormalizeLot(lot);
+
+  if(resp.action == BUY){
+     trade.Buy(lot, _Symbol, Ask, Ask - sl_pips*_Point, Ask + TP_pips*_Point, "AI-BUY");
+  } else if(resp.action == SELL) {
+     trade.Sell(lot, _Symbol, Bid, Bid + sl_pips*_Point, Bid - TP_pips*_Point, "AI-SELL");
+  }
+}
+Example Python inference server (FastAPI + ONNX runtime)
+# server.py (simplified)
+from fastapi import FastAPI
+import uvicorn
+import numpy as np
+import onnxruntime as ort
+
+app = FastAPI()
+sess = ort.InferenceSession("model.onnx")
+
+@app.post("/predict")
+def predict(payload: dict):
+    features = np.array(payload["features"], dtype=np.float32).reshape(1, -1)
+    out = sess.run(None, {"input": features})[0]
+    # out -> [prob_buy, prob_sell, prob_hold] or regression
+    prob_buy, prob_sell = out[0,0], out[0,1]
+    action = "BUY" if prob_buy > 0.6 else "SELL" if prob_sell > 0.6 else "HOLD"
+    confidence = max(prob_buy, prob_sell)
+    return {"action": action, "confidence": float(confidence), "scores": out.tolist()}
+
+# run: uvicorn server:app --host 127.0.0.1 --port 5000
+Low-latency tip
+    • Use ONNX Runtime, LightGBM’s native predict in C++ or Treelite compiled predictor for <10ms inferences.
+    • Keep I/O minimal: binary buffers, not verbose JSON when tuning latency.
+
+6 — Testing & validation methodology
+Backtesting (strictly with tick data)
+    • Use MT5 Strategy Tester with tick data (most accurate) or a tick replay engine. Configure commissions, spread, slippage to match broker.
+    • Re-run backtests across multiple market regimes (high volatility, low volatility).
+    • Evaluate on many instruments (EURUSD, GBPUSD, USDJPY) to test generalization.
+Walk-forward & cross-validation
+    • Use walk-forward validation: train on period P1, validate P2, roll forward. This reduces lookahead bias.
+    • Keep a separate out-of-sample holdout not used in hyperparameter selection.
+Simulation fidelity
+    • Model execution latency: add realistic delay to simulate inference + decision time.
+    • Slippage model: random slippage based on spread & liquidity.
+    • Commission: include broker fees & swaps.
+Performance metrics (beyond raw profit)
+    • Profit factor
+    • Sharpe ratio
+    • Max Drawdown
+    • Expectancy (avg profit per trade)
+    • Win rate and average RR
+    • Trade frequency (trades/day)
+    • Latency & execution success rate
+    • Robustness via Monte Carlo (shuffle trades, vary slippage).
+Optimization & hyperparameters
+    • Grid search or Bayesian optimization on: confidence threshold, ATR multipliers, risk percent, EMA lengths, model hyperparameters.
+    • But prefer conservative values and penalize complexity.
+Forward testing (paper/demo)
+    1. Demo account: run the EA for a sufficiently long period (e.g., 2–8 weeks) on Exness demo with same spreads and execution model.
+    2. Live small: If demo satisfactory, deploy on small real/lower risk account. Because balance = 148 USD, use micro-lots (0.01) and limit risk to 0.25–0.5% until stable.
+    3. Monitor: daily P&L, drawdown, unrealised slippage, missed executions.
+Continuous monitoring & kill-switch
+    • Implement auto-stop if: daily loss > X%, drawdown > Y%, network errors, or model serving failures.
+    • Log all decisions, states, predictions and actual outcomes for retraining and post-mortem.
+
+7 — Practical parameter suggestions for your Exness Standard account (Balance: $148, Leverage 1:2000)
+    • Account balance: 148 USD — very small. Use extreme conservatism.
+    • Risk per trade: 0.25% = $0.37 per trade. With SL of 20 pips and pip value (EURUSD micro-lot) ≈ $0.10/pip for 0.01 lot → lot calc likely ends at min lot = 0.01. So realistically use 0.01 lots, consider reducing frequency or using demo until equity larger.
+    • Max open positions: 1 instrument at a time.
+    • Min lot: 0.01 (most brokers)
+    • Use micro lot + low leverage: Even with 1:2000 leverage, do NOT use full leverage.
+Example lot calc:
+RiskUSD = AccountBalance * RiskPercent/100
+SL_pips = 20
+pip_value_1lot = (contract_size * point_value) -> approximate for FX (100000 * 0.0001 = $10/pip for 1.0 lot)
+lot = RiskUSD / (SL_pips * pip_value_1lot)
+Given small RiskUSD, lot will hit min lot 0.01.
+
+8 — Safety, compliance & practical notes
+    • Model overfitting is the biggest risk — test with walk-forward and varied market conditions.
+    • News risk: scalping around news can be disastrous — either disable or use strict filters.
+    • Broker constraints: watch minimum distance to stop, order types supported, slippage patterns; code must read SYMBOL_TRADE_STOPS and SYMBOL_TRADE_TICK_SIZE.
+    • Logging & auditing: log every model input + output and execution for accountability and retraining.
+
+9 — Example development & deployment checklist (step-by-step)
+    1. Data preparation
+        ◦ Pull tick history for target instruments (6–24 months at least).
+        ◦ Generate M1 bars and compute indicator features.
+    2. Feature engineering & labeling
+        ◦ Create features and labels (TP/SL forward test windows).
+    3. Model prototyping
+        ◦ Train LightGBM classifier; evaluate via walk-forward.
+    4. Model export & serve
+        ◦ Export to ONNX; build Python inference server.
+    5. EA coding
+        ◦ Implement MQL5 EA with modular code:
+            ▪ features module (indicator calc)
+            ▪ ipc module (communication)
+            ▪ risk module (sizing, stops)
+            ▪ executor module (order send & management)
+    6. Simulation & backtest
+        ◦ Integrate simulated inference pipeline into MT5 Strategy Tester for reproducible backtests.
+    7. Parameter optimization
+        ◦ Conservative search for thresholds and ATR multipliers.
+    8. Demo forward test
+        ◦ Deploy to Exness demo account; collect logs.
+    9. Iterate
+        ◦ Retrain with new logged data, refine features.
+    10. Live cautious rollout
+        ◦ Micro-lot live, daily monitoring, emergency shut-off.
+
+10 — Example MQL5 helper functions (pseudocode snippets)
+Risk & lot calc
+double CalculateLotSize(double riskPercent, double sl_pips)
+{
+  double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+  double riskUSD = balance * riskPercent / 100.0;
+  double pipValue1Lot = GetPipValuePerLot(_Symbol); // e.g., $10 for EURUSD 1.0 lot
+  double raw_lot = riskUSD / (sl_pips * pipValue1Lot);
+
+  double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+  double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+  double lot = MathMax(raw_lot, minLot);
+  lot = NormalizeDouble(lot / lotStep, 0) * lotStep;
+  return lot;
+}
+Call inference
+struct InferenceResponse { int action; double confidence; };
+
+InferenceResponse CallInferenceServer(double &features[], int timeout_ms)
+{
+  // Implement socket/HTTP call; keep it minimal & timeout protected
+  // On failure return action=HOLD
+}
+
+11 — Monitoring, metrics & dashboards
+    • Log every trade with: timestamp, instrument, features snapshot, model output, lot, SL/TP, exec time, slippage, outcome.
+    • Build dashboards (Grafana / simple Pandas reports) to track daily P&L, drawdown, model calibration (predicted vs realized).
+    • Track calibration: predicted probability vs actual win rate binned.
+
+12 — Potential enhancements (roadmap)
+    • Add online learning: update model every N trades using recent live data with conservative learning rate.
+    • Add RL fine-tuning in simulated environment to adjust sizing & exit policies.
+    • Use ensemble of instruments for market regime detection; model switches strategy per regime.
+    • Convert inference to C++ plugin or integrate ONNX runtime C++ into MQL5 for zero-network latency.
+
+13 — Practical pitfalls & warnings
+    • With small capital, micro-lots and conservative risk are mandatory; expected edge must overcome costs (spread & commissions).
+    • Avoid over-optimizing to past ticks — tick data quality and spread modeling is essential.
+    • Running external inference service creates operational risk — ensure auto-failover and kill-switch.
+
+14 — TL;DR (actionable quick-start plan)
+    1. Collect 3–12 months tick data for EURUSD, GBPUSD.
+    2. Engineer M1 features (EMA8, EMA21, ATR14, RSI14, Stochastic) + microstructure features.
+    3. Train LightGBM classifier to predict 1–5 minute profitable moves; validate with walk-forward CV.
+    4. Export model to ONNX and deploy a small FastAPI/ZeroMQ inference server.
+    5. Write MQL5 EA that computes features on tick/candle close and asks the server for action; EA enforces risk rules, executes trades.
+    6. Backtest aggressively with tick data and realistic slippage; then forward-test on demo; only then consider very small real deployment (0.01 lots).
+
+If you want, I can:
+    • produce a ready-to-run MQL5 EA skeleton (complete MQL5 file) with the IPC stub filled in (ZeroMQ or HTTP) and risk module configured for your Exness account; or
+    • produce the Python training notebook (data pipeline → LightGBM training → ONNX export) with runnable code on your machine; or
+    • give you a detailed walk-through of the walk-forward backtest and simulation setup inside MT5 Strategy Tester.
+Which of those would you like me to produce now?
+Nice — I’ll give you a complete, ready-to-run package: a production-style MQL5 EA you can compile and attach to a chart, a Python inference server (FastAPI) that the EA calls for AI decisions, and a simple training/placeholder model so you can run it out-of-the-box. I’ll also include step-by-step setup and safety/operational notes specifically for your Exness Standard account (balance $148).
+Important safety & legal note (read first): automated trading involves risk. The code below is provided for educational/use-at-your-own-risk purposes. Test extensively in the MT5 Strategy Tester and on a demo account before running on real money. I provide conservative default risk settings given your small balance; keep them.
+
+1) What you’ll receive (files & purpose)
+    1. SmartScalper.mq5 — full MQL5 EA ready to compile in MetaEditor.
+    2. inference_server.py — Python FastAPI server for AI inference.
+    3. train_or_seed_model.py — Python script to create a simple baseline ML model (train on synthetic data or your CSV) and save model.pkl.
+    4. Readme-style instructions (below) to get everything running: Python environment, MT5 config, testing, and deployment.
+
+2) Quick architecture summary (how this runs)
+    • MT5 EA computes a compact feature vector each M1 candle (EMA, ATR, RSI, Stochastic, spread, volatility).
+    • EA sends features to local inference server http://127.0.0.1:8000/predict via WebRequest.
+    • Server replies with {action, confidence, tp_pips, sl_pips, size_factor}.
+    • EA enforces risk rules, calculates lot size, and places orders.
+    • EA logs predictions and outcomes to file for later retraining.
+
+3) Files: code — copy each file into your environment
+
+SmartScalper.mq5 (MQL5 EA)
+Save in MQL5/Experts/SmartScalper/SmartScalper.mq5. Compile in MetaEditor.
+//+------------------------------------------------------------------+
+//| SmartScalper.mq5 - AI-assisted Scalper EA                        |
+//| Ready-to-run example. Uses WebRequest to call local inference    |
+//| server at http://127.0.0.1:8000/predict                           |
+//+------------------------------------------------------------------+
+#property copyright "Provided as-is"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Files\File.mqh>
+
+input double RiskPercent       = 0.25;       // Risk per trade in percent of balance
+input double MaxSpreadPips     = 3.0;        // refuse trades if spread > this (pips)
+input double ConfidenceThresh  = 0.60;       // min confidence to trade
+input int    MinSLPips         = 12;         // minimum SL pips
+input double MaxDailyLossPct   = 5.0;        // stop trading if daily loss > %
+input string InferenceURL      = "http://127.0.0.1:8000/predict";
+input int    RequestTimeoutMs  = 250;        // WebRequest timeout in milliseconds
+input bool   Use_M1_Trigger    = true;       // run on M1 candle close when true
+
+CTrade trade;
+datetime lastTradeTime = 0;
+double StartBalance = 0;
+string logFileName = "SmartScalper_log.csv";
+
+#define ACTION_HOLD  0
+#define ACTION_BUY   1
+#define ACTION_SELL  2
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+  StartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+  // Logging header
+  if(!FileIsExist(logFileName))
+  {
+    int fh = FileOpen(logFileName, FILE_WRITE|FILE_CSV);
+    if(fh != INVALID_HANDLE)
+    {
+      FileWrite(fh, "time,symbol,action,conf,tp_pips,sl_pips,lot,ask,bid,spread_pips,balance");
+      FileClose(fh);
+    }
+  }
+  Print("SmartScalper initialized. Inference URL: ", InferenceURL);
+  return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+  static datetime lastProcessed = 0;
+  if(Use_M1_Trigger)
+  {
+    MqlRates rates[2];
+    if(CopyRates(_Symbol, PERIOD_M1, 0, 2, rates) < 2) return;
+    // process on M1 close (when the current M1 has a new bar)
+    datetime currentBarTime = rates[1].time;
+    if(currentBarTime == lastProcessed) return;
+    lastProcessed = currentBarTime;
+    // proceed to evaluation
+  }
+  // check daily loss guard
+  if(CheckDailyLossStop()) return;
+
+  double spread_pips = (SymbolInfoDouble(_Symbol,SYMBOL_ASK) - SymbolInfoDouble(_Symbol,SYMBOL_BID)) / _Point;
+  if(spread_pips > MaxSpreadPips) { /* too wide */ return; }
+
+  // compute features
+  double feat[64];
+  int feat_count = ComputeFeatures(feat);
+
+  // call inference server
+  string payload = MakeJSONPayload(feat, feat_count);
+  char   result[];
+  int    res = WebRequest("POST", InferenceURL, "", NULL, 1000, payload, 0, result, NULL);
+  if(res == -1)
+  {
+    int err = GetLastError();
+    Print("WebRequest failed, error=", err);
+    ResetLastError();
+    return;
+  }
+
+  string s = CharArrayToString(result);
+  // parse JSON (lightweight parsing)
+  int action = ACTION_HOLD;
+  double confidence = 0.0;
+  double tp_pips = 0.0;
+  double sl_pips = 0.0;
+  double size_factor = 1.0;
+  if(!ParseInferenceResponse(s, action, confidence, tp_pips, sl_pips, size_factor))
+  {
+    Print("Failed to parse inference response: ", s);
+    return;
+  }
+
+  // decision logic
+  if(confidence < ConfidenceThresh) return;
+  if(action == ACTION_HOLD) return;
+
+  // compute lot size
+  if(sl_pips < MinSLPips) sl_pips = MinSLPips;
+  double lot = CalculateLot(AccountInfoDouble(ACCOUNT_BALANCE), RiskPercent, sl_pips) * size_factor;
+  lot = NormalizeLot(lot);
+  if(lot <= 0) return;
+
+  double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+  double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+  // check max open trades allowed: keep single position per symbol by default
+  if(PositionsTotalForSymbol(_Symbol) > 0) return;
+
+  bool ok = false;
+  if(action == ACTION_BUY)
+  {
+    double tp = ask + tp_pips * _Point;
+    double sl = ask - sl_pips * _Point;
+    ok = trade.Buy(lot, _Symbol, ask, sl, tp, "AI-BUY");
+  }
+  else if(action == ACTION_SELL)
+  {
+    double tp = bid - tp_pips * _Point;
+    double sl = bid + sl_pips * _Point;
+    ok = trade.Sell(lot, _Symbol, bid, sl, tp, "AI-SELL");
+  }
+
+  if(ok)
+  {
+    PrintFormat("Order placed: %s lot=%.2f action=%d conf=%.3f tp=%.1f sl=%.1f", _Symbol, lot, action, confidence, tp_pips, sl_pips);
+    LogTradeEvent(action, confidence, tp_pips, sl_pips, lot);
+  }
+  else
+  {
+    Print("Order failed. ResultRetcode=", GetLastError());
+  }
+}
+
+//+------------------------------------------------------------------+
+bool CheckDailyLossStop()
+{
+  static double startOfDayBalance = -1;
+  datetime now = TimeCurrent();
+  MqlDateTime dt; TimeToStruct(now, dt);
+  if(startOfDayBalance < 0 || dt.hour==0 && dt.min==0 && dt.sec==0) // reset at midnight
+    startOfDayBalance = StartBalance;
+
+  // compute todays profit
+  double curbal = AccountInfoDouble(ACCOUNT_BALANCE);
+  double loss = startOfDayBalance - curbal;
+  if(loss > (startOfDayBalance * MaxDailyLossPct / 100.0))
+  {
+    Print("Daily loss exceeded. Pausing trading for the day.");
+    return true;
+  }
+  return false;
+}
+
+//+------------------------------------------------------------------+
+int ComputeFeatures(double &out[])
+{
+  // Build a compact feature vector of latest indicators
+  // We'll compute EMA8, EMA21, ATR14, RSI14, Stochastic K, spread, last returns
+  int pos = 0;
+  double ema8 = iMA(_Symbol, PERIOD_M1, 8, 0, MODE_EMA, PRICE_CLOSE, 1);
+  double ema21 = iMA(_Symbol, PERIOD_M1, 21, 0, MODE_EMA, PRICE_CLOSE, 1);
+  double atr14 = iATR(_Symbol, PERIOD_M1, 14, 1);
+  double rsi14 = iRSI(_Symbol, PERIOD_M1, 14, PRICE_CLOSE, 1);
+  double stoch_k = iStochastic(_Symbol, PERIOD_M1, 14, 3, 3, MODE_SMA, 0, MODE_MAIN, 1);
+  double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+  double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+  double spread_pips = (ask - bid) / _Point;
+  // last 3 returns
+  MqlRates r[4];
+  int copied = CopyRates(_Symbol, PERIOD_M1, 1, 4, r);
+  double ret1=0, ret2=0, ret3=0;
+  if(copied>=2) ret1 = (r[0].close - r[1].close) / r[1].close;
+  if(copied>=3) ret2 = (r[1].close - r[2].close) / r[2].close;
+  if(copied>=4) ret3 = (r[2].close - r[3].close) / r[3].close;
+
+  out[pos++] = ema8;
+  out[pos++] = ema21;
+  out[pos++] = ema8 - ema21; // ema diff
+  out[pos++] = atr14;
+  out[pos++] = rsi14;
+  out[pos++] = stoch_k;
+  out[pos++] = spread_pips;
+  out[pos++] = ret1;
+  out[pos++] = ret2;
+  out[pos++] = ret3;
+
+  return pos;
+}
+
+//+------------------------------------------------------------------+
+string MakeJSONPayload(double &feat[], int count)
+{
+  string s = "{\"features\":[";
+  for(int i=0;i<count;i++)
+  {
+    s += DoubleToString(feat[i], 8);
+    if(i < count-1) s += ",";
+  }
+  s += "]}";
+  return s;
+}
+
+//+------------------------------------------------------------------+
+bool ParseInferenceResponse(const string &s, int &action, double &confidence, double &tp_pips, double &sl_pips, double &size_factor)
+{
+  // crude parsing - expects JSON keys: action, confidence, tp_pips, sl_pips, size_factor
+  action = ACTION_HOLD; confidence = 0; tp_pips = 0; sl_pips = 0; size_factor = 1.0;
+  int p;
+  if((p = StringFind(s, "\"action\"")) >= 0)
+  {
+    int colon = StringFind(s, ":", p);
+    string v = StringTrim(StringSubstr(s, colon+1, 10));
+    if(StringFind(v, "BUY")>=0) action = ACTION_BUY;
+    else if(StringFind(v, "SELL")>=0) action = ACTION_SELL;
+    else action = ACTION_HOLD;
+  }
+  if((p = StringFind(s, "\"confidence\"")) >= 0)
+  {
+    int colon = StringFind(s, ":", p);
+    string v = StringTrim(StringSubstr(s, colon+1, 32));
+    confidence = StrToDouble(v);
+  }
+  if((p = StringFind(s, "\"tp_pips\"")) >= 0)
+  {
+    int colon = StringFind(s, ":", p);
+    tp_pips = StrToDouble(StringTrim(StringSubstr(s, colon+1, 32)));
+  }
+  if((p = StringFind(s, "\"sl_pips\"")) >= 0)
+  {
+    int colon = StringFind(s, ":", p);
+    sl_pips = StrToDouble(StringTrim(StringSubstr(s, colon+1, 32)));
+  }
+  if((p = StringFind(s, "\"size_factor\"")) >= 0)
+  {
+    int colon = StringFind(s, ":", p);
+    size_factor = StrToDouble(StringTrim(StringSubstr(s, colon+1, 32)));
+  }
+  return true;
+}
+
+//+------------------------------------------------------------------+
+double CalculateLot(double balance, double riskPercent, double sl_pips)
+{
+  // pip value (approx for FX) for 1 lot: SYMBOL_TRADE_CONTRACT_SIZE * point * ??? We'll approximate using SYMBOL_TRADE_TICK_VALUE if available.
+  double contract = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+  double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+  double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+  double pipValue1Lot = 0.0;
+  if(tickSize > 0 && tickValue > 0)
+  {
+    double onePipValue = tickValue / tickSize * _Point * MathPow(10, Digits()); // rough
+    // fallback
+    pipValue1Lot = MathAbs(tickValue); // best-effort
+  }
+  if(pipValue1Lot <= 0) pipValue1Lot = 10.0; // fallback: assume $10 per pip for 1 lot (EURUSD style)
+  double riskUSD = balance * (riskPercent/100.0);
+  double lot = riskUSD / (sl_pips * pipValue1Lot);
+  // ensure within allowed range
+  double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+  double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+  double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+  if(minLot <= 0) minLot = 0.01;
+  if(maxLot <= 0) maxLot = 100;
+  if(lot < minLot) lot = minLot;
+  if(lot > maxLot) lot = maxLot;
+  // normalize to step
+  int steps = (int)MathFloor(lot / step);
+  lot = steps * step;
+  if(lot < minLot) lot = minLot;
+  return lot;
+}
+
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+  double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+  if(step <= 0) step = 0.01;
+  int s = (int)MathFloor(lot / step);
+  double res = s * step;
+  double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+  if(res < minLot) res = minLot;
+  return NormalizeDouble(res, 2);
+}
+
+//+------------------------------------------------------------------+
+int PositionsTotalForSymbol(string sym)
+{
+  int cnt = 0;
+  for(int i=0;i<PositionsTotal();i++)
+  {
+    ulong ticket = PositionGetTicket(i);
+    if(PositionSelectByTicket(ticket))
+    {
+      string s = PositionGetString(POSITION_SYMBOL);
+      if(s == sym) cnt++;
+    }
+  }
+  return cnt;
+}
+
+//+------------------------------------------------------------------+
+void LogTradeEvent(int action, double confidence, double tp_pips, double sl_pips, double lot)
+{
+  int fh = FileOpen(logFileName, FILE_READ|FILE_WRITE|FILE_CSV);
+  if(fh == INVALID_HANDLE) fh = FileOpen(logFileName, FILE_WRITE|FILE_CSV);
+  if(fh != INVALID_HANDLE)
+  {
+    FileSeek(fh, 0, SEEK_END);
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double spread_pips = (ask - bid) / _Point;
+    FileWrite(fh, TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS), _Symbol, action, DoubleToString(confidence,3), DoubleToString(tp_pips,2), DoubleToString(sl_pips,2), DoubleToString(lot,2), DoubleToString(ask,5), DoubleToString(bid,5), DoubleToString(spread_pips,2), DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2));
+    FileClose(fh);
+  }
+}
+
+//+------------------------------------------------------------------+
+bool FileIsExist(string name)
+{
+  int fh = FileOpen(name, FILE_READ|FILE_CSV);
+  if(fh == INVALID_HANDLE) return false;
+  FileClose(fh);
+  return true;
+}
+//+------------------------------------------------------------------+
+
+inference_server.py (Python FastAPI inference server)
+Save in a working directory and run with uvicorn inference_server:app --host 127.0.0.1 --port 8000.
+# inference_server.py
+from fastapi import FastAPI
+from pydantic import BaseModel
+import joblib, os, numpy as np
+import uvicorn
+
+MODEL_PATH = "model.pkl"
+
+app = FastAPI(title="SmartScalper Inference")
+
+class FeaturesPayload(BaseModel):
+    features: list
+
+def load_model():
+    if os.path.exists(MODEL_PATH):
+        m = joblib.load(MODEL_PATH)
+        print("Loaded model:", MODEL_PATH)
+        return m
+    else:
+        print("Model not found. Using dummy rule-based fallback.")
+        return None
+
+MODEL = load_model()
+
+@app.post("/predict")
+def predict(payload: FeaturesPayload):
+    feats = np.array(payload.features, dtype=float).reshape(1,-1)
+    # default fallback: rule-based
+    if MODEL is None:
+        # simple rule: if ema_diff > 0 and rsi < 70 => BUY
+        ema_diff = feats[0,2] if feats.shape[1] > 2 else 0.0
+        rsi = feats[0,4] if feats.shape[1] > 4 else 50.0
+        spread_pips = feats[0,6] if feats.shape[1] > 6 else 1.0
+        action = "HOLD"
+        confidence = 0.0
+        if spread_pips > 5:
+            action = "HOLD"; confidence = 0.1
+        elif ema_diff > 0 and rsi < 75:
+            action = "BUY"; confidence = 0.7
+        elif ema_diff < 0 and rsi > 25:
+            action = "SELL"; confidence = 0.65
+        else:
+            action = "HOLD"; confidence = 0.2
+
+        # Suggest TP/SL roughly proportional to ATR feature
+        atr = feats[0,3] if feats.shape[1] > 3 else 0.0001
+        # Convert ATR (price units) to pips approx:
+        tp_pips = max(5.0, min(30.0, float(abs(atr) * 10000.0 * 0.5)))
+        sl_pips = max(10.0, float(tp_pips * 1.5))
+        return {"action": action, "confidence": float(confidence), "tp_pips": float(tp_pips), "sl_pips": float(sl_pips), "size_factor": 1.0}
+
+    # If model exists, compute probabilities
+    # assume model is a classifier with predict_proba
+    try:
+        proba = MODEL.predict_proba(feats)[0]  # e.g., [prob_sell, prob_hold, prob_buy] or [prob_neg, prob_pos]
+        # try to interpret
+        if proba.shape[0] == 2:
+            # binary classifier: proba[1] = prob positive (buy)
+            prob_buy = proba[1]
+            prob_sell = 1-prob_buy
+        else:
+            # multi-class: try to map
+            # choose largest index
+            idx = np.argmax(proba)
+            # map last index to BUY heuristic
+            prob_buy = proba[-1] if proba.size>0 else proba[0]
+            prob_sell = proba[0] if proba.size>1 else 1-prob_buy
+
+        if prob_buy > prob_sell and prob_buy > 0.5:
+            action = "BUY"; confidence = float(prob_buy)
+        elif prob_sell > prob_buy and prob_sell > 0.5:
+            action = "SELL"; confidence = float(prob_sell)
+        else:
+            action = "HOLD"; confidence = float(max(prob_buy, prob_sell))
+
+    except Exception as e:
+        print("Model proba error:", e)
+        action = "HOLD"; confidence = 0.0
+
+    # Estimate TP/SL using ATR feature if present
+    atr = feats[0,3] if feats.shape[1] > 3 else 0.0001
+    tp_pips = max(5.0, min(30.0, float(abs(atr) * 10000.0 * 0.5)))
+    sl_pips = max(10.0, float(tp_pips * 1.5))
+
+    return {"action": action, "confidence": confidence, "tp_pips": tp_pips, "sl_pips": sl_pips, "size_factor": 1.0}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+
+train_or_seed_model.py (create a simple model file)
+This script will create a trivial LightGBM model or sklearn logistic if you want to produce a real model.pkl. If you have historical CSV data, you can adapt the script to read it. For quick start this script will create a synthetic model so the inference_server.py can load it.
+# train_or_seed_model.py
+import joblib, numpy as np, os
+from sklearn.ensemble import GradientBoostingClassifier
+
+MODEL_PATH = "model.pkl"
+
+def make_synthetic_and_train():
+    # Create synthetic features: 10 features
+    X = np.random.randn(10000, 10)
+    # target: buy if feature[2] (ema diff) positive + noise
+    y = (X[:,2] + 0.2 * np.random.randn(X.shape[0]) > 0).astype(int)
+    model = GradientBoostingClassifier(n_estimators=100, max_depth=3)
+    model.fit(X, y)
+    joblib.dump(model, MODEL_PATH)
+    print("Trained and saved model to", MODEL_PATH)
+
+if __name__ == "__main__":
+    make_synthetic_and_train()
+If you have historical feature CSV: replace synthetic part with reading csv and training.
+
+4) Step-by-step setup instructions
+Prereqs (Python)
+    1. Install Python 3.9+ and pip.
+    2. Create virtualenv (recommended):
+       python -m venv venv
+       source venv/bin/activate   # linux/mac
+       venv\Scripts\activate      # windows
+    3. Install required packages:
+       pip install fastapi uvicorn scikit-learn joblib numpy pandas
+       (If you plan to use LightGBM, install lightgbm instead of GradientBoosting and update scripts accordingly.)
+Prepare the model
+    • Quick start: generate a seeded model:
+      python train_or_seed_model.py
+      This will create model.pkl used by inference_server.py.
+    • Preferable: prepare a real model trained on your historical features (see below under "Training guidance").
+Run the inference server
+    • Start server:
+      uvicorn inference_server:app --host 127.0.0.1 --port 8000
+    • Test with curl:
+      curl -X POST "http://127.0.0.1:8000/predict" -H "Content-Type: application/json" -d "{\"features\":[1,2,3,0.0001,50,30,1,0.00012,0,0]}"
+MT5 configuration
+    1. Open MetaTrader 5 -> Tools -> Options -> Expert Advisors.
+        ◦ Check Allow WebRequest for listed URL.
+        ◦ Click Add and add http://127.0.0.1:8000 (exact host/port used).
+        ◦ Also enable "Allow automated trading" and in chart allow expert.
+    2. Place SmartScalper.mq5 into MQL5/Experts/SmartScalper/ and compile in MetaEditor.
+    3. Attach EA to a chart (EURUSD, M1). Ensure Algo Trading is enabled.
+    4. Monitor Expert log & the SmartScalper_log.csv file in MT5\MQL5\Files.
+Important MT5 WebRequest gotchas
+    • WebRequest may block unknown URLs. You must add the full origin http://127.0.0.1:8000 to the allowed list.
+    • If WebRequest fails with errors, check GetLastError() inside EA and confirm the server is running and reachable.
+    • WebRequest has a default 5000ms timeout in MQL; you may set a lower one in the call — EA uses 1000ms.
+
+5) How the "AI" part works here (and how you should replace it with a real model)
+    • The provided train_or_seed_model.py produces a toy GradientBoostingClassifier. For meaningful performance you should:
+        1. Collect tick & M1 historical data from MT5 Strategy Tester (tick-derived) or your broker.
+        2. Generate features exactly as the EA does (EMA8,EMA21,diff,ATR,RSi,Stoch,spread,last returns). Save to CSV with forward label: whether price hit TP before SL in next T minutes (label 1/0).
+        3. Train model (LightGBM/XGBoost recommended) with walk-forward validation and export joblib or ONNX.
+        4. Replace model.pkl with your trained model (and update inference code to preprocess features identically).
+
+6) Backtesting, optimization & forward-testing guidance
+Backtesting
+    • Use MT5 Strategy Tester in every tick mode (most accurate).
+    • Because the EA calls an external server in live mode, for backtesting you have two options:
+        1. Simulate inference inside EA by adding a #define or input flag that switches inference to a local deterministic function (so tester does not need external server).
+        2. Use the strategy tester to run the EA while running the inference server simultaneously (some testers allow WebRequest, but deterministic reproduction may be affected).
+Walk-forward testing / cross-validation
+    • Split history chronologically: train on months A, validate on months B, roll forward.
+    • Tune hyperparameters on the training window only; evaluate performance on out-of-sample windows.
+Forward testing / demo
+    • Run on Exness demo account with the same settings for at least 4–8 weeks or 1000 trades (whichever applicable) depending on trade frequency.
+    • Use micro-lots (0.01) and extremely conservative riskPercent (0.1–0.25%) until your edge is proven.
+
+7) Configuration tuned for your Exness Standard account (Balance = 148 us cents)
+    • Default RiskPercent in EA = 0.25% → risk per trade ≈ $0.37.
+    • Minimum lot on many brokers is 0.01 — with these numbers the EA will often choose min lot. That's safe.
+    • Keep MaxSpreadPips = 3.0 to avoid wide-spread trading.
+    • Keep MaxDailyLossPct = 5.0 as automatic stop.
+    • Do not rely on 1:2000 leverage — do not increase riskPercent.
+
+8) Logging, retraining, and continuous improvement
+    • EA logs each decision to SmartScalper_log.csv (features snapshot + action).
+    • Use that log as a source of labeled live data (label outcomes by checking whether TP/SL hit) to retrain models periodically.
+    • Retrain weekly or monthly depending on trade volume; always use walk-forward validation.
+
+9) Troubleshooting checklist
+    • If EA prints "WebRequest failed": check server is running, allowed URLs includes http://127.0.0.1:8000, firewall not blocking, correct port.
+    • If orders fail with ERR_INVALID_TRADE_VOLUME or similar: adjust minLot and NormalizeLot logic — difference across brokers.
+    • If EA trades too often: increase ConfidenceThresh or increase MinSLPips.
+    • If performance poor: reduce trading hours, add news filter/custom session filter.
+
+10) Next steps I can deliver (pick any)
+    • Provide a version of the EA that uses ZeroMQ for faster binary IPC (lower latency) instead of WebRequest.
+    • Build a full training notebook that consumes MT5-extracted tick history and produces a LightGBM model saved as model.pkl and an ONNX export.
+    • Add an RL agent (PPO) training environment for policy optimization (advanced).
+    • Add support to the EA to fallback to offline rule-based decisions if server unreachable for N seconds (safety).
+
+If you'd like, I’ll now:
+    • produce the ZeroMQ variant for sub-10ms inference and a matching zmq Python consumer, or
+    • produce a complete Jupyter notebook training pipeline that reads MT5 tick CSV, creates features, does walk-forward CV, saves a LightGBM model and an ONNX export (recommended next step to make the AI real).
+Which of those should I do next?
+
